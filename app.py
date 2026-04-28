@@ -1,19 +1,16 @@
+import warnings
+warnings.filterwarnings("ignore")
+
 import os
 import io
 import base64
-import logging
-import numpy as np
+import threading
+import torch
+import torch.nn as nn
+from torchvision.models import mobilenet_v3_small
+from torchvision import transforms
 from PIL import Image
 from flask import Flask, request, jsonify
-import onnxruntime as ort
-
-# =======================
-# LOGGING
-# =======================
-logging.basicConfig(level=logging.INFO)
-
-print("🚀 Starting API...")
-print("PORT:", os.environ.get("PORT"))
 
 # =======================
 # CONFIG
@@ -27,78 +24,61 @@ CLASSES = [
 ]
 
 CONFIDENCE_THRESHOLD = 0.60
-MAX_IMAGE_BYTES = 10 * 1024 * 1024
-
-MODEL_PATH = "fallehi_student.onnx"
-
-# =======================
-# LOAD MODEL (SAFE)
-# =======================
-
-try:
-    session = ort.InferenceSession(
-        MODEL_PATH,
-        providers=["CPUExecutionProvider"]
-    )
-    input_name = session.get_inputs()[0].name
-    print("✅ ONNX model loaded")
-except Exception as e:
-    print("❌ Model load failed:", e)
-    raise
+MAX_IMAGE_BYTES = 4000 * 1024 * 1024  # 4000 MB
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+MODEL_PATH = os.path.join(BASE_DIR, "student_best.pth")
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 # =======================
-# PREPROCESS
+# MODEL
 # =======================
 
-def preprocess(image: Image.Image):
-    image = image.resize((224, 224))
-    img = np.array(image).astype(np.float32) / 255.0
+def load_model() -> torch.jit.ScriptModule:
+    model = mobilenet_v3_small(weights=None)
+    model.classifier[3] = nn.Linear(model.classifier[3].in_features, len(CLASSES))
+    state_dict = torch.load(MODEL_PATH, map_location=DEVICE, weights_only=True)
+    model.load_state_dict(state_dict)
+    model.to(DEVICE)
+    model.eval()
+    # Compile to TorchScript for faster, thread-safe inference
+    scripted = torch.jit.script(model)
+    return scripted
 
-    mean = np.array([0.485, 0.456, 0.406])
-    std = np.array([0.229, 0.224, 0.225])
+model = load_model()
+_model_lock = threading.Lock()
 
-    img = (img - mean) / std
-    img = np.transpose(img, (2, 0, 1))
-    return np.expand_dims(img, axis=0).astype(np.float32)
+transform = transforms.Compose([
+    transforms.Resize((224, 224)),
+    transforms.ToTensor(),
+    transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
+])
 
 # =======================
-# SOFTMAX
+# PREDICTION
 # =======================
 
-def softmax(x):
-    e = np.exp(x - np.max(x))
-    return e / e.sum()
-
-# =======================
-# PREDICT
-# =======================
-
-def predict(image: Image.Image):
-    tensor = preprocess(image)
-
-    outputs = session.run(None, {input_name: tensor})
-    logits = outputs[0][0]
-
-    probs = softmax(logits)
-
-    top_idx = int(np.argmax(probs))
-    top_prob = float(probs[top_idx])
+def predict(image: Image.Image) -> dict:
+    tensor = transform(image).unsqueeze(0).to(DEVICE)
+    with _model_lock:
+        with torch.no_grad():
+            output = model(tensor)
+    probs = torch.softmax(output, dim=1)[0]
+    top_prob = float(probs.max())
+    top_idx = int(probs.argmax())
 
     if top_prob < CONFIDENCE_THRESHOLD:
-        return {"valid": False, "message": "Low confidence"}
+        return {"valid": False, "message": "Not a leaf or confidence too low"}
 
-    top3_idx = probs.argsort()[-3:][::-1]
-
-    top3 = [
-        {"class": CLASSES[i], "prob": round(float(probs[i]), 4)}
-        for i in top3_idx
-    ]
+    top3 = sorted(
+        [{"class": CLASSES[i], "prob": round(float(probs[i]), 4)} for i in range(len(CLASSES))],
+        key=lambda x: x["prob"], reverse=True
+    )[:3]
 
     return {
         "valid": True,
         "disease": CLASSES[top_idx],
         "confidence": round(top_prob * 100, 2),
-        "top3": top3
+        "top3": top3,
     }
 
 # =======================
@@ -109,39 +89,40 @@ app = Flask(__name__)
 
 @app.route("/health", methods=["GET"])
 def health():
-    return jsonify({"status": "ok"})
+    return jsonify({"status": "ok", "device": str(DEVICE)})
 
 @app.route("/analyze", methods=["POST"])
 def analyze():
     data = request.get_json(silent=True)
-
     if not data or "image" not in data:
-        return jsonify({"error": "Missing image"}), 400
+        return jsonify({"error": "Missing 'image' field (base64-encoded)"}), 400
+
+    raw = data["image"]
+    if not isinstance(raw, str):
+        return jsonify({"error": "'image' must be a base64 string"}), 400
 
     try:
-        image_bytes = base64.b64decode(data["image"])
-    except:
-        return jsonify({"error": "Invalid base64"}), 400
+        image_bytes = base64.b64decode(raw, validate=True)
+    except Exception:
+        return jsonify({"error": "Invalid base64 encoding"}), 400
 
     if len(image_bytes) > MAX_IMAGE_BYTES:
-        return jsonify({"error": "Image too large"}), 413
+        return jsonify({"error": "Image exceeds 10 MB limit"}), 413
 
     try:
         image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
-    except:
-        return jsonify({"error": "Invalid image"}), 422
+    except Exception as e:
+        return jsonify({"error": f"Cannot decode image: {e}"}), 422
 
-    result = predict(image)
-
-    if not result.get("valid"):
-        return jsonify(result), 422
+    try:
+        result = predict(image)
+    except Exception as e:
+        app.logger.exception("Inference failed")
+        return jsonify({"error": "Inference error", "detail": str(e)}), 500
 
     return jsonify(result)
 
-# =======================
-# ENTRYPOINT
-# =======================
-
+# Dev entrypoint only — use Gunicorn in production
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
-    app.run(host="0.0.0.0", port=port)
+    app.run(host="0.0.0.0", port=port, debug=False)
