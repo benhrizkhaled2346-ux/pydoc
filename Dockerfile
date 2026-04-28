@@ -1,9 +1,10 @@
 FROM python:3.11-slim
 
+# Security user
 RUN useradd --create-home appuser
 WORKDIR /app
 
-# Install only what is needed
+# Install only required dependencies
 RUN pip install --no-cache-dir \
     flask==3.0.0 \
     gunicorn==22.0.0 \
@@ -16,10 +17,14 @@ COPY app.py .
 COPY fallehi_student.onnx .
 COPY fallehi_student.onnx.data .
 
+# Railway-safe env
 ENV PYTHONUNBUFFERED=1 \
-    OMP_NUM_THREADS=2
+    OMP_NUM_THREADS=1 \
+    ORT_DISABLE_MEMORY_ARENA=1
 
 USER appuser
+
 EXPOSE 5000
 
-CMD ["gunicorn", "app:app", "--workers", "2", "--threads", "2", "--bind", "0.0.0.0:5000"]
+# IMPORTANT: Railway requires $PORT
+CMD ["sh", "-c", "gunicorn app:app --workers 1 --threads 2 --timeout 120 --bind 0.0.0.0:$PORT"]
